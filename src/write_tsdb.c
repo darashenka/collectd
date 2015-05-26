@@ -308,7 +308,7 @@ static int wt_format_values(char *ret, size_t ret_len,
 } while (0)
 
     if (ds->ds[ds_num].type == DS_TYPE_GAUGE)
-        BUFFER_ADD("%f", vl->values[ds_num].gauge);
+        BUFFER_ADD(GAUGE_FORMAT, vl->values[ds_num].gauge);
     else if (store_rates)
     {
         if (rates == NULL)
@@ -319,7 +319,7 @@ static int wt_format_values(char *ret, size_t ret_len,
                     "uc_get_rate failed.");
             return -1;
         }
-        BUFFER_ADD("%f", rates[ds_num]);
+        BUFFER_ADD(GAUGE_FORMAT, rates[ds_num]);
     }
     else if (ds->ds[ds_num].type == DS_TYPE_COUNTER)
         BUFFER_ADD("%llu", vl->values[ds_num].counter);
@@ -365,30 +365,41 @@ static int wt_format_name(char *ret, int ret_len,
 
     if (ds_name != NULL) {
         if (vl->plugin_instance[0] == '\0') {
-            ssnprintf(ret, ret_len, "%s%s.%s",
-                      prefix, vl->plugin, ds_name);
-        } else if (vl->type_instance[0] == '\0') {
-            ssnprintf(ret, ret_len, "%s%s.%s.%s.%s",
-                      prefix, vl->plugin, vl->plugin_instance,
-                      vl->type_instance, ds_name);
-        } else {
-            ssnprintf(ret, ret_len, "%s%s.%s.%s.%s",
-                      prefix, vl->plugin, vl->plugin_instance, vl->type,
-                      ds_name);
+            if (vl->type_instance[0] == '\0') {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s", prefix, vl->plugin,
+                        vl->type, ds_name);
+            } else {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s.%s", prefix, vl->plugin,
+                        vl->type, vl->type_instance, ds_name);
+            }
+        } else { /* vl->plugin_instance != "" */
+            if (vl->type_instance[0] == '\0') {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s.%s", prefix, vl->plugin,
+                        vl->plugin_instance, vl->type, ds_name);
+            } else {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s.%s.%s", prefix,
+                        vl->plugin, vl->plugin_instance, vl->type,
+                        vl->type_instance, ds_name);
+            }
         }
-    } else if (vl->plugin_instance[0] == '\0') {
-        if (vl->type_instance[0] == '\0')
-            ssnprintf(ret, ret_len, "%s%s.%s",
-                      prefix, vl->plugin, vl->type);
-        else
-            ssnprintf(ret, ret_len, "%s%s.%s",
-                      prefix, vl->plugin, vl->type_instance);
-    } else if (vl->type_instance[0] == '\0') {
-        ssnprintf(ret, ret_len, "%s%s.%s.%s",
-                  prefix, vl->plugin, vl->plugin_instance, vl->type);
-    } else {
-        ssnprintf(ret, ret_len, "%s%s.%s.%s.%s",
-                  prefix, vl->plugin, vl->plugin_instance, vl->type, vl->type_instance);
+    } else { /* ds_name == NULL */
+        if (vl->plugin_instance[0] == '\0') {
+            if (vl->type_instance[0] == '\0') {
+                ssnprintf(ret, ret_len, "%s%s.%s", prefix, vl->plugin,
+                        vl->type);
+            } else {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s", prefix, vl->plugin,
+                        vl->type_instance, vl->type);
+            }
+        } else { /* vl->plugin_instance != "" */
+            if (vl->type_instance[0] == '\0') {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s", prefix, vl->plugin,
+                        vl->plugin_instance, vl->type);
+            } else {
+                ssnprintf(ret, ret_len, "%s%s.%s.%s.%s", prefix, vl->plugin,
+                        vl->plugin_instance, vl->type, vl->type_instance);
+            }
+        }
     }
 
     sfree(temp);

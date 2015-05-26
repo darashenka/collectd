@@ -359,6 +359,12 @@ ethstat_la_SOURCES = ethstat.c
 ethstat_la_LDFLAGS = $(PLUGIN_LDFLAGS)
 endif
 
+if BUILD_PLUGIN_FHCOUNT
+pkglib_LTLIBRARIES += fhcount.la
+fhcount_la_SOURCES = fhcount.c
+fhcount_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+endif
+
 if BUILD_PLUGIN_FILECOUNT
 pkglib_LTLIBRARIES += filecount.la
 filecount_la_SOURCES = filecount.c
@@ -405,6 +411,13 @@ if BUILD_WITH_PERFSTAT
 interface_la_LIBADD += -lperfstat
 endif
 endif # BUILD_PLUGIN_INTERFACE
+
+if BUILD_PLUGIN_IPC
+pkglib_LTLIBRARIES += ipc.la
+ipc_la_SOURCES = ipc.c
+ipc_la_CFLAGS = $(AM_CFLAGS)
+ipc_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+endif
 
 if BUILD_PLUGIN_IPTABLES
 pkglib_LTLIBRARIES += iptables.la
@@ -696,7 +709,7 @@ if BUILD_PLUGIN_NOTIFY_EMAIL
 pkglib_LTLIBRARIES += notify_email.la
 notify_email_la_SOURCES = notify_email.c
 notify_email_la_LDFLAGS = $(PLUGIN_LDFLAGS)
-notify_email_la_LIBADD = -lesmtp -lssl -lcrypto -lpthread -ldl
+notify_email_la_LIBADD = -lesmtp -lssl -lcrypto -lpthread
 endif
 
 if BUILD_PLUGIN_NTPD
@@ -1075,6 +1088,12 @@ tokyotyrant_la_LIBADD += -lsocket
 endif
 endif
 
+if BUILD_PLUGIN_TURBOSTAT
+pkglib_LTLIBRARIES += turbostat.la
+turbostat_la_SOURCES = turbostat.c
+turbostat_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+endif
+
 if BUILD_PLUGIN_UNIXSOCK
 pkglib_LTLIBRARIES += unixsock.la
 unixsock_la_SOURCES = unixsock.c \
@@ -1187,6 +1206,7 @@ write_kafka_la_SOURCES = write_kafka.c \
                         utils_format_json.c utils_format_json.h \
                         utils_cmd_putval.c utils_cmd_putval.h \
                         utils_crc32.c utils_crc32.h
+write_kafka_la_CPPFLAGS = $(AM_CPPFLAGS) $(BUILD_WITH_LIBRDKAFKA_CPPFLAGS)
 write_kafka_la_LDFLAGS = $(PLUGIN_LDFLAGS) $(BUILD_WITH_LIBRDKAFKA_LDFLAGS)
 write_kafka_la_LIBADD = $(BUILD_WITH_LIBRDKAFKA_LIBS)
 endif
@@ -1220,6 +1240,12 @@ write_riemann_la_SOURCES = write_riemann.c write_riemann_threshold.c
 nodist_write_riemann_la_SOURCES = riemann.pb-c.c riemann.pb-c.h
 write_riemann_la_LDFLAGS = $(PLUGIN_LDFLAGS)
 write_riemann_la_LIBADD = -lprotobuf-c
+endif
+
+if BUILD_PLUGIN_WRITE_SENSU
+pkglib_LTLIBRARIES += write_sensu.la
+write_sensu_la_SOURCES = write_sensu.c
+write_sensu_la_LDFLAGS = $(PLUGIN_LDFLAGS)
 endif
 
 if BUILD_PLUGIN_WRITE_TSDB
@@ -1357,6 +1383,7 @@ check_PROGRAMS = test_common test_utils_avltree test_utils_heap test_utils_mount
 
 test_common_SOURCES = tests/test_common.c \
                       daemon/common.h daemon/common.c \
+                      tests/macros.h \
                       tests/mock/plugin.c \
                       tests/mock/utils_cache.c \
                       tests/mock/utils_time.c
