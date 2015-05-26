@@ -17,7 +17,7 @@
  * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  *
  * Authors:
- *   Florian octo Forster <octo at verplant.org>
+ *   Florian octo Forster <octo at collectd.org>
  *   Aman Gupta <aman at tmm1.net>
  **/
 
@@ -26,6 +26,7 @@
 #include "plugin.h"
 #include "configfile.h"
 #include "utils_match.h"
+#include "utils_time.h"
 
 #include <curl/curl.h>
 
@@ -57,12 +58,15 @@ struct web_page_s /* {{{ */
   char *user;
   char *pass;
   char *credentials;
+  _Bool digest;
   _Bool verify_peer;
   _Bool verify_host;
   char *cacert;
   struct curl_slist *headers;
   char *post_body;
   _Bool response_time;
+  _Bool response_code;
+  int timeout;
 
   CURL *curl;
   char curl_errbuf[CURL_ERROR_SIZE];
@@ -89,7 +93,7 @@ static size_t cc_curl_callback (void *buf, /* {{{ */
 {
   web_page_t *wp;
   size_t len;
-  
+
   len = size * nmemb;
   if (len <= 0)
     return (len);
@@ -362,8 +366,7 @@ static int cc_page_init_curl (web_page_t *wp) /* {{{ */
   curl_easy_setopt (wp->curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt (wp->curl, CURLOPT_WRITEFUNCTION, cc_curl_callback);
   curl_easy_setopt (wp->curl, CURLOPT_WRITEDATA, wp);
-  curl_easy_setopt (wp->curl, CURLOPT_USERAGENT,
-      PACKAGE_NAME"/"PACKAGE_VERSION);
+  curl_easy_setopt (wp->curl, CURLOPT_USERAGENT, COLLECTD_USERAGENT);
   curl_easy_setopt (wp->curl, CURLOPT_ERRORBUFFER, wp->curl_errbuf);
   curl_easy_setopt (wp->curl, CURLOPT_URL, wp->url);
   curl_easy_setopt (wp->curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -371,6 +374,11 @@ static int cc_page_init_curl (web_page_t *wp) /* {{{ */
 
   if (wp->user != NULL)
   {
+#ifdef HAVE_CURLOPT_USERNAME
+    curl_easy_setopt (wp->curl, CURLOPT_USERNAME, wp->user);
+    curl_easy_setopt (wp->curl, CURLOPT_PASSWORD,
+        (wp->pass == NULL) ? "" : wp->pass);
+#else
     size_t credentials_size;
 
     credentials_size = strlen (wp->user) + 2;
@@ -387,6 +395,10 @@ static int cc_page_init_curl (web_page_t *wp) /* {{{ */
     ssnprintf (wp->credentials, credentials_size, "%s:%s",
         wp->user, (wp->pass == NULL) ? "" : wp->pass);
     curl_easy_setopt (wp->curl, CURLOPT_USERPWD, wp->credentials);
+#endif
+
+    if (wp->digest)
+      curl_easy_setopt (wp->curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
   }
 
   curl_easy_setopt (wp->curl, CURLOPT_SSL_VERIFYPEER, (long) wp->verify_peer);
@@ -398,6 +410,14 @@ static int cc_page_init_curl (web_page_t *wp) /* {{{ */
     curl_easy_setopt (wp->curl, CURLOPT_HTTPHEADER, wp->headers);
   if (wp->post_body != NULL)
     curl_easy_setopt (wp->curl, CURLOPT_POSTFIELDS, wp->post_body);
+
+#ifdef HAVE_CURLOPT_TIMEOUT_MS
+  if (wp->timeout >= 0)
+    curl_easy_setopt (wp->curl, CURLOPT_TIMEOUT_MS, (long) wp->timeout);
+  else
+    curl_easy_setopt (wp->curl, CURLOPT_TIMEOUT_MS,
+       CDTIME_T_TO_MS(plugin_get_interval()));
+#endif
 
   return (0);
 } /* }}} int cc_page_init_curl */
@@ -424,9 +444,12 @@ static int cc_config_add_page (oconfig_item_t *ci) /* {{{ */
   page->url = NULL;
   page->user = NULL;
   page->pass = NULL;
+  page->digest = 0;
   page->verify_peer = 1;
   page->verify_host = 1;
   page->response_time = 0;
+  page->response_code = 0;
+  page->timeout = -1;
 
   page->instance = strdup (ci->values[0].value.string);
   if (page->instance == NULL)
@@ -448,12 +471,16 @@ static int cc_config_add_page (oconfig_item_t *ci) /* {{{ */
       status = cf_util_get_string (child, &page->user);
     else if (strcasecmp ("Password", child->key) == 0)
       status = cf_util_get_string (child, &page->pass);
+    else if (strcasecmp ("Digest", child->key) == 0)
+      status = cf_util_get_boolean (child, &page->digest);
     else if (strcasecmp ("VerifyPeer", child->key) == 0)
       status = cf_util_get_boolean (child, &page->verify_peer);
     else if (strcasecmp ("VerifyHost", child->key) == 0)
       status = cf_util_get_boolean (child, &page->verify_host);
     else if (strcasecmp ("MeasureResponseTime", child->key) == 0)
       status = cf_util_get_boolean (child, &page->response_time);
+    else if (strcasecmp ("MeasureResponseCode", child->key) == 0)
+      status = cf_util_get_boolean (child, &page->response_code);
     else if (strcasecmp ("CACert", child->key) == 0)
       status = cf_util_get_string (child, &page->cacert);
     else if (strcasecmp ("Match", child->key) == 0)
@@ -463,6 +490,8 @@ static int cc_config_add_page (oconfig_item_t *ci) /* {{{ */
       status = cc_config_append_string ("Header", &page->headers, child);
     else if (strcasecmp ("Post", child->key) == 0)
       status = cf_util_get_string (child, &page->post_body);
+    else if (strcasecmp ("Timeout", child->key) == 0)
+      status = cf_util_get_int (child, &page->timeout);
     else
     {
       WARNING ("curl plugin: Option `%s' not allowed here.", child->key);
@@ -482,11 +511,12 @@ static int cc_config_add_page (oconfig_item_t *ci) /* {{{ */
       status = -1;
     }
 
-    if (page->matches == NULL && !page->response_time)
+    if (page->matches == NULL && !page->response_time && !page->response_code)
     {
       assert (page->instance != NULL);
       WARNING ("curl plugin: No (valid) `Match' block "
-          "or MeasureResponseTime within `Page' block `%s'.", page->instance);
+          "or MeasureResponseTime or MeasureResponseCode within "
+          "`Page' block `%s'.", page->instance);
       status = -1;
     }
 
@@ -587,12 +617,30 @@ static void cc_submit (const web_page_t *wp, const web_match_t *wm, /* {{{ */
   plugin_dispatch_values (&vl);
 } /* }}} void cc_submit */
 
-static void cc_submit_response_time (const web_page_t *wp, double seconds) /* {{{ */
+static void cc_submit_response_code (const web_page_t *wp, long code) /* {{{ */
 {
   value_t values[1];
   value_list_t vl = VALUE_LIST_INIT;
 
-  values[0].gauge = seconds;
+  values[0].gauge = code;
+
+  vl.values = values;
+  vl.values_len = 1;
+  sstrncpy (vl.host, hostname_g, sizeof (vl.host));
+  sstrncpy (vl.plugin, "curl", sizeof (vl.plugin));
+  sstrncpy (vl.plugin_instance, wp->instance, sizeof (vl.plugin_instance));
+  sstrncpy (vl.type, "response_code", sizeof (vl.type));
+
+  plugin_dispatch_values (&vl);
+} /* }}} void cc_submit_response_code */
+
+static void cc_submit_response_time (const web_page_t *wp, /* {{{ */
+    cdtime_t response_time)
+{
+  value_t values[1];
+  value_list_t vl = VALUE_LIST_INIT;
+
+  values[0].gauge = CDTIME_T_TO_DOUBLE (response_time);
 
   vl.values = values;
   vl.values_len = 1;
@@ -608,27 +656,33 @@ static int cc_read_page (web_page_t *wp) /* {{{ */
 {
   web_match_t *wm;
   int status;
-  struct timeval start, end;
+  cdtime_t start = 0;
 
   if (wp->response_time)
-    gettimeofday (&start, NULL);
+    start = cdtime ();
 
   wp->buffer_fill = 0;
   status = curl_easy_perform (wp->curl);
   if (status != CURLE_OK)
   {
-    ERROR ("curl plugin: curl_easy_perform failed with staus %i: %s",
+    ERROR ("curl plugin: curl_easy_perform failed with status %i: %s",
         status, wp->curl_errbuf);
     return (-1);
   }
 
   if (wp->response_time)
+    cc_submit_response_time (wp, cdtime() - start);
+
+  if(wp->response_code)
   {
-    double secs = 0;
-    gettimeofday (&end, NULL);
-    secs += end.tv_sec - start.tv_sec;
-    secs += (end.tv_usec - start.tv_usec) / 1000000.0;
-    cc_submit_response_time (wp, secs);
+    long response_code = 0;
+    status = curl_easy_getinfo(wp->curl, CURLINFO_RESPONSE_CODE, &response_code);
+    if(status != CURLE_OK) {
+      ERROR ("curl plugin: Fetching response code failed with status %i: %s",
+        status, wp->curl_errbuf);
+    } else {
+      cc_submit_response_code(wp, response_code);
+    }
   }
 
   for (wm = wp->matches; wm != NULL; wm = wm->next)

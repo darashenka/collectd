@@ -35,6 +35,8 @@
   *   <Carbon>
   *     Host "localhost"
   *     Port "2003"
+  *     Protocol "udp"
+  *     LogSendErrors true
   *     Prefix "collectd"
   *   </Carbon>
   * </Plugin>
@@ -47,7 +49,6 @@
 
 #include "utils_cache.h"
 #include "utils_complain.h"
-#include "utils_parse_option.h"
 #include "utils_format_graphite.h"
 
 /* Folks without pthread will need to disable this plugin. */
@@ -64,6 +65,14 @@
 # define WG_DEFAULT_SERVICE "2003"
 #endif
 
+#ifndef WG_DEFAULT_PROTOCOL
+# define WG_DEFAULT_PROTOCOL "tcp"
+#endif
+
+#ifndef WG_DEFAULT_LOG_SEND_ERRORS
+# define WG_DEFAULT_LOG_SEND_ERRORS 1
+#endif
+
 #ifndef WG_DEFAULT_ESCAPE
 # define WG_DEFAULT_ESCAPE '_'
 #endif
@@ -71,6 +80,10 @@
 /* Ethernet - (IPv6 + TCP) = 1500 - (40 + 32) = 1428 */
 #ifndef WG_SEND_BUF_SIZE
 # define WG_SEND_BUF_SIZE 1428
+#endif
+
+#ifndef WG_MIN_RECONNECT_INTERVAL
+# define WG_MIN_RECONNECT_INTERVAL TIME_T_TO_CDTIME_T (1)
 #endif
 
 /*
@@ -84,6 +97,8 @@ struct wg_callback
 
     char    *node;
     char    *service;
+    char    *protocol;
+    _Bool   log_send_errors;
     char    *prefix;
     char    *postfix;
     char     escape_char;
@@ -97,6 +112,7 @@ struct wg_callback
 
     pthread_mutex_t send_lock;
     c_complain_t init_complaint;
+    cdtime_t last_connect_time;
 };
 
 
@@ -118,10 +134,15 @@ static int wg_send_buffer (struct wg_callback *cb)
     status = swrite (cb->sock_fd, cb->send_buf, strlen (cb->send_buf));
     if (status < 0)
     {
-        char errbuf[1024];
-        ERROR ("write_graphite plugin: send failed with status %zi (%s)",
-                status, sstrerror (errno, errbuf, sizeof (errbuf)));
+        const char *protocol = cb->protocol ? cb->protocol : WG_DEFAULT_PROTOCOL;
 
+        if (cb->log_send_errors)
+        {
+            char errbuf[1024];
+            ERROR ("write_graphite plugin: send to %s:%s (%s) failed with status %zi (%s)",
+                    cb->node, cb->service, protocol,
+                    status, sstrerror (errno, errbuf, sizeof (errbuf)));
+        }
 
         close (cb->sock_fd);
         cb->sock_fd = -1;
@@ -169,30 +190,43 @@ static int wg_callback_init (struct wg_callback *cb)
     struct addrinfo ai_hints;
     struct addrinfo *ai_list;
     struct addrinfo *ai_ptr;
+    cdtime_t now;
     int status;
 
     const char *node = cb->node ? cb->node : WG_DEFAULT_NODE;
     const char *service = cb->service ? cb->service : WG_DEFAULT_SERVICE;
+    const char *protocol = cb->protocol ? cb->protocol : WG_DEFAULT_PROTOCOL;
 
     char connerr[1024] = "";
 
     if (cb->sock_fd > 0)
         return (0);
 
+    /* Don't try to reconnect too often. By default, one reconnection attempt
+     * is made per second. */
+    now = cdtime ();
+    if ((now - cb->last_connect_time) < WG_MIN_RECONNECT_INTERVAL)
+        return (EAGAIN);
+    cb->last_connect_time = now;
+
     memset (&ai_hints, 0, sizeof (ai_hints));
 #ifdef AI_ADDRCONFIG
     ai_hints.ai_flags |= AI_ADDRCONFIG;
 #endif
     ai_hints.ai_family = AF_UNSPEC;
-    ai_hints.ai_socktype = SOCK_STREAM;
+
+    if (0 == strcasecmp ("tcp", protocol))
+        ai_hints.ai_socktype = SOCK_STREAM;
+    else
+        ai_hints.ai_socktype = SOCK_DGRAM;
 
     ai_list = NULL;
 
     status = getaddrinfo (node, service, &ai_hints, &ai_list);
     if (status != 0)
     {
-        ERROR ("write_graphite plugin: getaddrinfo (%s, %s) failed: %s",
-                node, service, gai_strerror (status));
+        ERROR ("write_graphite plugin: getaddrinfo (%s, %s, %s) failed: %s",
+                node, service, protocol, gai_strerror (status));
         return (-1);
     }
 
@@ -230,15 +264,15 @@ static int wg_callback_init (struct wg_callback *cb)
             /* this should not happen but try to get a message anyway */
             sstrerror (errno, connerr, sizeof (connerr));
         c_complain (LOG_ERR, &cb->init_complaint,
-                "write_graphite plugin: Connecting to %s:%s failed. "
-                "The last error was: %s", node, service, connerr);
+                  "write_graphite plugin: Connecting to %s:%s via %s failed. "
+                  "The last error was: %s", node, service, protocol, connerr);
         return (-1);
     }
     else
     {
         c_release (LOG_INFO, &cb->init_complaint,
-                "write_graphite plugin: Successfully connected to %s:%s.",
-                node, service);
+                "write_graphite plugin: Successfully connected to %s:%s via %s.",
+                node, service, protocol);
     }
 
     wg_reset_buffer (cb);
@@ -267,6 +301,7 @@ static void wg_callback_free (void *data)
 
     sfree(cb->name);
     sfree(cb->node);
+    sfree(cb->protocol);
     sfree(cb->service);
     sfree(cb->prefix);
     sfree(cb->postfix);
@@ -347,9 +382,10 @@ static int wg_send_message (char const *message, struct wg_callback *cb)
     cb->send_buf_fill += message_len;
     cb->send_buf_free -= message_len;
 
-    DEBUG ("write_graphite plugin: [%s]:%s buf %zu/%zu (%.1f %%) \"%s\"",
+    DEBUG ("write_graphite plugin: [%s]:%s (%s) buf %zu/%zu (%.1f %%) \"%s\"",
             cb->node,
             cb->service,
+            cb->protocol,
             cb->send_buf_fill, sizeof (cb->send_buf),
             100.0 * ((double) cb->send_buf_fill) / ((double) sizeof (cb->send_buf)),
             message);
@@ -439,6 +475,7 @@ static int wg_config_node (oconfig_item_t *ci)
     user_data_t user_data;
     char callback_name[DATA_MAX_NAME_LEN];
     int i;
+    int status = 0;
 
     cb = malloc (sizeof (*cb));
     if (cb == NULL)
@@ -451,6 +488,8 @@ static int wg_config_node (oconfig_item_t *ci)
     cb->name = NULL;
     cb->node = NULL;
     cb->service = NULL;
+    cb->protocol = NULL;
+    cb->log_send_errors = WG_DEFAULT_LOG_SEND_ERRORS;
     cb->prefix = NULL;
     cb->postfix = NULL;
     cb->escape_char = WG_DEFAULT_ESCAPE;
@@ -459,7 +498,7 @@ static int wg_config_node (oconfig_item_t *ci)
     /* FIXME: Legacy configuration syntax. */
     if (strcasecmp ("Carbon", ci->key) != 0)
     {
-        int status = cf_util_get_string (ci, &cb->name);
+        status = cf_util_get_string (ci, &cb->name);
         if (status != 0)
         {
             wg_callback_free (cb);
@@ -478,6 +517,20 @@ static int wg_config_node (oconfig_item_t *ci)
             cf_util_get_string (child, &cb->node);
         else if (strcasecmp ("Port", child->key) == 0)
             cf_util_get_service (child, &cb->service);
+        else if (strcasecmp ("Protocol", child->key) == 0)
+        {
+            cf_util_get_string (child, &cb->protocol);
+
+            if (strcasecmp ("UDP", cb->protocol) != 0 &&
+                strcasecmp ("TCP", cb->protocol) != 0)
+            {
+                ERROR ("write_graphite plugin: Unknown protocol (%s)",
+                        cb->protocol);
+                status = -1;
+            }
+        }
+        else if (strcasecmp ("LogSendErrors", child->key) == 0)
+            cf_util_get_boolean (child, &cb->log_send_errors);
         else if (strcasecmp ("Prefix", child->key) == 0)
             cf_util_get_string (child, &cb->prefix);
         else if (strcasecmp ("Postfix", child->key) == 0)
@@ -497,14 +550,25 @@ static int wg_config_node (oconfig_item_t *ci)
         {
             ERROR ("write_graphite plugin: Invalid configuration "
                         "option: %s.", child->key);
+            status = -1;
         }
+
+        if (status != 0)
+            break;
+    }
+
+    if (status != 0)
+    {
+        wg_callback_free (cb);
+        return (status);
     }
 
     /* FIXME: Legacy configuration syntax. */
     if (cb->name == NULL)
-        ssnprintf (callback_name, sizeof (callback_name), "write_graphite/%s/%s",
+        ssnprintf (callback_name, sizeof (callback_name), "write_graphite/%s/%s/%s",
                 cb->node != NULL ? cb->node : WG_DEFAULT_NODE,
-                cb->service != NULL ? cb->service : WG_DEFAULT_SERVICE);
+                cb->service != NULL ? cb->service : WG_DEFAULT_SERVICE,
+                cb->protocol != NULL ? cb->protocol : WG_DEFAULT_PROTOCOL);
     else
         ssnprintf (callback_name, sizeof (callback_name), "write_graphite/%s",
                 cb->name);

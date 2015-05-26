@@ -27,7 +27,6 @@
 
 #include "utils_format_graphite.h"
 #include "utils_cache.h"
-#include "utils_parse_option.h"
 
 #define GRAPHITE_FORBIDDEN " \t\"\\:!/()\n\r"
 
@@ -61,7 +60,7 @@ static int gr_format_values (char *ret, size_t ret_len,
 } while (0)
 
     if (ds->ds[ds_num].type == DS_TYPE_GAUGE)
-        BUFFER_ADD ("%f", vl->values[ds_num].gauge);
+        BUFFER_ADD (GAUGE_FORMAT, vl->values[ds_num].gauge);
     else if (rates != NULL)
         BUFFER_ADD ("%f", rates[ds_num]);
     else if (ds->ds[ds_num].type == DS_TYPE_COUNTER)
